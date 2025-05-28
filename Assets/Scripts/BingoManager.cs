@@ -1,103 +1,206 @@
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
+using Photon.Pun;
+using Photon.Realtime;
 
-public class BingoManager : MonoBehaviour
+public class BingoManager : MonoBehaviourPunCallbacks
 {
-    public List<Button> bingoButtons; // Assign 25 buttons in Inspector
-    public Text instructionText; // Assign a Text UI for instructions
+    public GameObject myPanel;           // Set in Inspector: Panel with 25 buttons for local player
+    public GameObject opponentPanel;     // Set in Inspector: Panel with 25 buttons for opponent
+    public Text instructionText;
+
+    private List<Button> myButtons = new();
+    private List<Button> opponentButtons = new();
+    private Dictionary<int, Button> myNumberMap = new();
+    private Dictionary<int, Button> opponentNumberMap = new();
+
+    private Button[,] myGrid = new Button[5, 5];
+    private Button[,] opponentGrid = new Button[5, 5];
 
     private int currentNumber = 1;
-    private bool placementDone = false;
-    private Dictionary<Button, bool> isPlaced = new Dictionary<Button, bool>();
-
-    private Button[,] grid = new Button[5, 5];
+    private bool isMyTurn = false;
+    private bool myPlacementDone = false;
+    private bool opponentPlacementDone = false;
+    private bool placementPhase = true;
 
     void Start()
     {
-        instructionText.text = "Start placing numbers";
+        ExtractButtons();
+        SetupGrids();
+        SetupButtonListeners();
+        opponentPanel.SetActive(false);
+        instructionText.text = "Place numbers (1 to 25)";
+    }
 
-        // Build 5x5 grid
-        for (int i = 0; i < bingoButtons.Count; i++)
-        {
-            isPlaced[bingoButtons[i]] = false;
-            int row = i / 5;
-            int col = i % 5;
-            grid[row, col] = bingoButtons[i];
-        }
 
-        // Add listeners
-        foreach (Button btn in bingoButtons)
+    void ExtractButtons()
+    {
+        myButtons.AddRange(myPanel.GetComponentsInChildren<Button>());
+        opponentButtons.AddRange(opponentPanel.GetComponentsInChildren<Button>());
+
+        // Clean up opponent board display
+        foreach (var btn in opponentButtons)
         {
-            btn.onClick.AddListener(() => OnButtonClick(btn));
+            btn.GetComponentInChildren<Text>().text = "";
         }
     }
 
-    void OnButtonClick(Button btn)
+    void SetupGrids()
     {
-        Text btnText = btn.GetComponentInChildren<Text>();
-
-        if (!placementDone && !isPlaced[btn])
+        for (int i = 0; i < 25; i++)
         {
-            btnText.text = currentNumber.ToString();
-            isPlaced[btn] = true;
-            currentNumber++;
+            int row = i / 5;
+            int col = i % 5;
+            myGrid[row, col] = myButtons[i];
+            opponentGrid[row, col] = opponentButtons[i];
+        }
+    }
 
+    void SetupButtonListeners()
+    {
+        for (int i = 0; i < myButtons.Count; i++)
+        {
+            int index = i;
+            myButtons[i].onClick.AddListener(() => OnMyButtonClick(index));
+        }
+    }
+
+    void OnMyButtonClick(int index)
+    {
+        Button btn = myButtons[index];
+
+        if (placementPhase && string.IsNullOrEmpty(btn.GetComponentInChildren<Text>().text))
+        {
+            btn.GetComponentInChildren<Text>().text = currentNumber.ToString();
+            myNumberMap[currentNumber] = btn;
+
+            // Tell opponent to set this number on the same index (without showing it)
+            photonView.RPC("SetOpponentNumber", RpcTarget.Others, index, currentNumber);
+
+            currentNumber++;
             if (currentNumber <= 25)
-                instructionText.text = $"Next number is {currentNumber}";
+            {
+                instructionText.text = $"Next number: {currentNumber}";
+            }
             else
             {
-                placementDone = true;
-                instructionText.text = "Check the number";
+                myPlacementDone = true;
+                instructionText.text = "Waiting for opponent...";
+                photonView.RPC("NotifyPlacementDone", RpcTarget.Others);
+                CheckStartGame();
             }
         }
-        else if (placementDone && btn.interactable)
+        else if (!placementPhase && isMyTurn && btn.interactable)
         {
-            btn.interactable = false;
-            instructionText.text = $"Number {btnText.text} Cut";
-
-            if (CheckForWin())
-            {
-                instructionText.text = " You win the game!";
-            }
+            int number = int.Parse(btn.GetComponentInChildren<Text>().text);
+            photonView.RPC("CutNumber", RpcTarget.All, number);
         }
+    }
+
+    [PunRPC]
+    void SetOpponentNumber(int index, int number)
+    {
+        Button btn = opponentButtons[index];
+        opponentNumberMap[number] = btn;
+    }
+
+    [PunRPC]
+    void NotifyPlacementDone()
+    {
+        opponentPlacementDone = true;
+        CheckStartGame();
+    }
+
+    void CheckStartGame()
+    {
+        if (myPlacementDone && opponentPlacementDone)
+        {
+            placementPhase = false;
+            isMyTurn = PhotonNetwork.IsMasterClient;
+            instructionText.text = isMyTurn ? "Your turn: Cut a number!" : "Waiting for opponent...";
+        }
+    }
+
+    [PunRPC]
+    void CutNumber(int number)
+    {
+        // Disable number on your board
+        if (myNumberMap.ContainsKey(number))
+        {
+            var btn = myNumberMap[number];
+            btn.interactable = false;
+            btn.GetComponentInChildren<Text>().color = Color.red;
+        }
+
+        // Show cut on opponent board
+        if (opponentNumberMap.ContainsKey(number))
+        {
+            var btn = opponentNumberMap[number];
+            btn.interactable = false;
+            btn.GetComponentInChildren<Text>().text = "X";
+            btn.GetComponentInChildren<Text>().color = Color.red;
+        }
+
+        instructionText.text = isMyTurn ? $"You cut {number}. Waiting..." : $"Opponent cut {number}. Your turn!";
+
+        if (CheckForWin())
+        {
+            int winner = PhotonNetwork.IsMasterClient == isMyTurn ? 1 : 2;
+            photonView.RPC("DeclareWinner", RpcTarget.All, winner);
+        }
+        else
+        {
+            isMyTurn = !isMyTurn;
+        }
+    }
+
+    [PunRPC]
+    void DeclareWinner(int winnerPlayer)
+    {
+        string result = (PhotonNetwork.IsMasterClient && winnerPlayer == 1) || (!PhotonNetwork.IsMasterClient && winnerPlayer == 2)
+            ? "You Win!"
+            : "You Lose!";
+        instructionText.text = result;
+        isMyTurn = false;
     }
 
     bool CheckForWin()
     {
-        int completedLines = 0;
+        int lines = 0;
 
-        // Check Rows
-        for (int row = 0; row < 5; row++)
+        // Rows
+        for (int i = 0; i < 5; i++)
         {
-            int count = 0;
-            for (int col = 0; col < 5; col++)
-                if (!grid[row, col].interactable) count++;
-            if (count == 5) completedLines++;
+            bool complete = true;
+            for (int j = 0; j < 5; j++)
+                if (myGrid[i, j].interactable)
+                    complete = false;
+            if (complete) lines++;
         }
 
-        // Check Columns
-        for (int col = 0; col < 5; col++)
+        // Columns
+        for (int j = 0; j < 5; j++)
         {
-            int count = 0;
-            for (int row = 0; row < 5; row++)
-                if (!grid[row, col].interactable) count++;
-            if (count == 5) completedLines++;
+            bool complete = true;
+            for (int i = 0; i < 5; i++)
+                if (myGrid[i, j].interactable)
+                    complete = false;
+            if (complete) lines++;
         }
 
-        // Check Main Diagonal
-        int diag1 = 0;
+        // Diagonal
+        bool diag1 = true, diag2 = true;
         for (int i = 0; i < 5; i++)
-            if (!grid[i, i].interactable) diag1++;
-        if (diag1 == 5) completedLines++;
+        {
+            if (myGrid[i, i].interactable) diag1 = false;
+            if (myGrid[i, 4 - i].interactable) diag2 = false;
+        }
+        if (diag1) lines++;
+        if (diag2) lines++;
 
-        // Check Anti-Diagonal
-        int diag2 = 0;
-        for (int i = 0; i < 5; i++)
-            if (!grid[i, 4 - i].interactable) diag2++;
-        if (diag2 == 5) completedLines++;
-
-        return completedLines >= 5;
+        return lines >= 5;
     }
+    
 
 }
